@@ -6,10 +6,11 @@ Codex 额度挂件 —— 贴在 Windows 任务栏上的半透明小挂件。
 取数服务再向上游代理查询 Codex 用量。本脚本只负责展示，不直接联网。
 
 命令行用法：
-    python codex_quota_bar.py              启动挂件（正常情况用不到手敲）
-    python codex_quota_bar.py --install    写开机自启并立即启动
-    python codex_quota_bar.py --uninstall  取消开机自启并停止
-    python codex_quota_bar.py --check      自检：打印配置并试拉一次数据
+    python codex_quota_bar.py                  启动挂件（用第一个数据源）
+    python codex_quota_bar.py --item gemini    指定显示哪个数据源
+    python codex_quota_bar.py --install        为所有数据源写入开机自启并启动
+    python codex_quota_bar.py --uninstall      取消开机自启并停止
+    python codex_quota_bar.py --check          自检：打印配置并逐个试拉
 """
 import argparse
 import ctypes
@@ -39,7 +40,6 @@ CONFIG_PATH = os.environ.get("CODEX_QUOTA_CONFIG",
                              os.path.join(HERE, "config.json"))
 BRIDGE_PY   = os.path.join(HERE, "quota_bridge.py")
 PYTHONW     = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-BAR_PID_FILE = os.path.join(HERE, "bar.pid")
 BRIDGE_PID_FILE = os.path.join(HERE, "bridge.pid")
 WATCHDOG_MS = 15000
 REFRESH_MS  = 30000
@@ -85,20 +85,35 @@ def install_excepthooks():
 
 
 def load_config():
-    cfg = {"bridge_port": 28317, "refresh_seconds": 30}
+    cfg = {"bridge_port": 28317, "refresh_seconds": 30, "cache_seconds": 90,
+           "sources": []}
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
                 cfg.update(json.load(f))
         except Exception as e:
             print("config.json 解析失败: %s" % e, file=sys.stderr)
+    # 兼容旧版扁平配置
+    if not cfg.get("sources") and cfg.get("proxy"):
+        cfg["sources"] = [{"id": "codex", "label": "Codex", "kind": "codex"}]
     return cfg
 
 
 CFG         = load_config()
 BRIDGE_PORT = int(CFG.get("bridge_port", 28317))
-BRIDGE      = "http://127.0.0.1:%d/" % BRIDGE_PORT
 REFRESH_MS  = int(CFG.get("refresh_seconds", 30)) * 1000
+ITEM        = os.environ.get("CODEX_QUOTA_ITEM") or ""      # 由 --item 覆盖
+
+
+def set_item(item):
+    """切换当前显示的数据源，并同步互斥量名与 pid 文件名。"""
+    global ITEM, MUTEX_SUFFIX, BAR_PID_FILE
+    ITEM = item or ""
+    MUTEX_SUFFIX = ("_" + re.sub(r"[^A-Za-z0-9]", "", ITEM)) if ITEM else ""
+    BAR_PID_FILE = os.path.join(HERE, "bar%s.pid" % ("-" + ITEM if ITEM else ""))
+
+
+set_item(ITEM)
 
 # 图形界面按需加载：--check / --install 不依赖 tkinter
 try:
@@ -114,11 +129,16 @@ BORDER      = "#2E3238"
 FG          = "#E8EAED"
 FG_DIM      = "#9AA0A6"
 SEPARATOR   = "#3A3F46"
+ACCENT      = "#7AA2F7"
 
 GOOD, WARN, BAD, OFF = "#3DD68C", "#F5A524", "#F2555A", "#6B7280"
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_VAL = "CodexQuotaBar"
+RUN_VAL_PREFIX = "CodexQuotaBar"
+
+
+def _run_name(item=""):
+    return "%s:%s" % (RUN_VAL_PREFIX, item) if item else RUN_VAL_PREFIX
 
 
 def _rect(hwnd):
@@ -184,12 +204,51 @@ def _dock_obstacles(tb):
     return lefts
 
 
-def taskbar_geometry():
-    """返回 (任务栏下沿 y, 挂件右边界 x, 任务栏顶沿 y, 任务栏高度)。
+def taskbar_gap():
+    """任务栏上可以自由占用的横向区间 (left, right)。
 
-    右边界取「系统托盘左沿」与「其它挂件左沿」中更靠左的一个，
-    这样挂件会紧挨在 TrafficMonitor 之类显示项的左边，不会互相遮挡。
+    左边界 = 任务按钮区的右沿（系统图标优先，挂件绝不去压它）
+    右边界 = 托盘左沿 与 其它第三方挂件左沿 中更靠左的一个
     """
+    tbh = user32.FindWindowW("Shell_TrayWnd", None)
+    if not tbh:
+        return None
+    tb = _rect(tbh)
+    if not tb:
+        return None
+
+    # 左边界：任务按钮 / 开始菜单那一段的右沿
+    left = tb[0]
+    for cls in ("MSTaskSwWClass", "MSTaskListWClass", "MSTaskTabWClass",
+                "ReBarWindow32"):
+        h = user32.FindWindowExW(tbh, 0, cls, None)
+        if h:
+            r = _rect(h)
+            if r:
+                left = max(left, r[2])
+
+    # 右边界：托盘左沿
+    right = tb[2]
+    tray = user32.FindWindowExW(tbh, 0, "TrayNotifyWnd", None)
+    if not tray:
+        tray = user32.FindWindowExW(tbh, 0, "TrayButton", None)
+    if not tray:
+        tray = user32.FindWindowExW(tbh, 0,
+                                    "Windows.UI.Composition.DesktopWindowContentBridge", None)
+    if tray:
+        t = _rect(tray)
+        if t:
+            right = min(right, t[0])
+
+    # 其它第三方挂件也要让
+    for l in _dock_obstacles(tb):
+        right = min(right, l)
+
+    return (left, right) if right > left else None
+
+
+def taskbar_geometry():
+    """返回 (任务栏下沿 y, 挂件右边界 x, 任务栏顶沿 y, 任务栏高度)。"""
     hwnd = user32.FindWindowW("Shell_TrayWnd", None)
     if not hwnd:
         sw = user32.GetSystemMetrics(0)
@@ -199,13 +258,13 @@ def taskbar_geometry():
     tb = _rect(hwnd)
     height = tb[3] - tb[1]
 
+    edges = []
     tray = user32.FindWindowExW(hwnd, 0, "TrayNotifyWnd", None)
     if not tray:
         tray = user32.FindWindowExW(hwnd, 0, "TrayButton", None)
     if not tray:
         tray = user32.FindWindowExW(hwnd, 0,
                                     "Windows.UI.Composition.DesktopWindowContentBridge", None)
-    edges = []
     if tray:
         t = _rect(tray)
         if t:
@@ -227,6 +286,29 @@ def bridge_alive():
         return False
 
 
+def fetch_quota(force=False, item=""):
+    """向本地取数服务要数据。force=True 时带 force=1 真正打一次上游。"""
+    if item:
+        url = "http://127.0.0.1:%d/?item=%s" % (BRIDGE_PORT, item)
+    else:
+        url = "http://127.0.0.1:%d/all" % BRIDGE_PORT
+    if force:
+        url += ("&" if "?" in url else "?") + "force=1"
+    with urllib.request.urlopen(url, timeout=25 if force else 8) as r:
+        d = json.loads(r.read().decode("utf-8"))
+    if item:
+        return [d]
+    return d.get("rows", [])
+
+
+def bridge_items():
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/items" % BRIDGE_PORT, timeout=6) as r:
+            return json.loads(r.read().decode("utf-8")).get("items", [])
+    except Exception:
+        return []
+
+
 def ensure_bridge():
     if bridge_alive():
         return
@@ -243,11 +325,6 @@ def ensure_bridge():
         time.sleep(0.5)
 
 
-def fetch_quota():
-    with urllib.request.urlopen(BRIDGE, timeout=6) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-
 def parse(text, default=None):
     """从 "5h 91% · 4h18m" 这类文本里取出第一个百分数。取不到就返回 default。"""
     if not text:
@@ -262,54 +339,63 @@ def parse(text, default=None):
 
 
 # ---------------- 开机自启 ----------------
-def autostart_enabled():
+def autostart_enabled(item=""):
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
-            return winreg.QueryValueEx(k, RUN_VAL)[0]
+            return winreg.QueryValueEx(k, _run_name(item))[0]
     except Exception:
         return None
 
 
-def set_autostart(on):
+def set_autostart(on, item=""):
     import winreg
+    name = _run_name(item)
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
         if on:
             cmd = '"%s" "%s"' % (PYTHONW, os.path.abspath(__file__))
-            winreg.SetValueEx(k, RUN_VAL, 0, winreg.REG_SZ, cmd)
+            if item:
+                cmd += " --item %s" % item
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, cmd)
         else:
             try:
-                winreg.DeleteValue(k, RUN_VAL)
+                winreg.DeleteValue(k, name)
             except FileNotFoundError:
                 pass
 
 
 # ---------------- 挂件 ----------------
 def acquire_single_instance():
-    """已有一个挂件在跑就退出，避免重复启动出现两个。"""
+    """同一个数据源已经在跑就退出，避免重复启动出现两个。每个数据源一个互斥量。"""
     k32 = ctypes.windll.kernel32
-    k32.CreateMutexW(None, False, "Local\\CodexQuotaBarSingleton")
+    k32.CreateMutexW(None, False, "Local\\QuotaBarSingleton" + MUTEX_SUFFIX)
     return k32.GetLastError() != 183      # 183 = ERROR_ALREADY_EXISTS
 
 
 class QuotaBar:
     PAD_X = 14
+    PAD_Y = 7
     RADIUS = 9
-    HEIGHT = 30
+    ROW_H = 23
+    BALL = 46                # 悬浮球直径
+    GAP_PAD = 10             # 任务栏空隙两边各留的余量
+    CLICK_SLOP = 4        # 指针移动超过这么多像素就算拖拽，不算点击
+    CLICK_TIME = 0.6      # 按下超过这么久也不算点击
 
     def __init__(self):
         ensure_bridge()
 
         # 首次同步取数，保证第一次绘制就有内容、尺寸正确
-        try:
-            self.data = fetch_quota()
-        except Exception:
-            self.data = {"five": "-- 离线", "week": "--", "detail": "取数服务无响应"}
+        self.item = ITEM
+        self.rows = self._first_fetch()
 
         self.pos = None
         self._drag = None
         self._tip = None
         self._busy = False
+        self._flash = 0.0
+        self._mode = None
+        self._stale = False
 
         self.root = tk.Tk()
         self.root.overrideredirect(True)
@@ -322,7 +408,9 @@ class QuotaBar:
 
         # 用像素字号，避免 150% 缩放下按磅换算出错
         self.f_bold = tkfont.Font(family="Microsoft YaHei UI", size=-17, weight="bold")
-        self.f_reg = tkfont.Font(family="Microsoft YaHei UI", size=-17)
+        self.f_reg = tkfont.Font(family="Microsoft YaHei UI", size=-16)
+        self.f_lbl = tkfont.Font(family="Microsoft YaHei UI", size=-14)
+        self.f_ball = tkfont.Font(family="Microsoft YaHei UI", size=-13, weight="bold")
 
         self.cv = None
         self._build_canvas()
@@ -342,7 +430,7 @@ class QuotaBar:
         cv.bind("<Button-3>", self.on_menu)
         cv.bind("<Enter>", lambda e: self.show_tip())
         cv.bind("<Leave>", lambda e: self.hide_tip())
-        cv.bind("<Double-Button-1>", lambda e: self.refresh(force=True))
+        cv.bind("<Double-Button-1>", lambda e: self._click_feedback())
         self.cv = cv
         return cv
 
@@ -381,7 +469,28 @@ class QuotaBar:
             except Exception:
                 pass
 
+        self._check_mode()
         self.root.after(WATCHDOG_MS, self.watchdog)
+
+    def _check_mode(self):
+        """任务按钮区宽度会随开关的窗口变化，形态要跟着在药丸/悬浮球之间切换。
+
+        只有用户没手动拖动过（self.pos 由系统算的）时才自动挪位置。
+        """
+        try:
+            gap = taskbar_gap()
+            plan = self._plan()
+            want = plan["mode"]
+            if self._mode == want:
+                return
+            self._mode = want
+            wlog("形态切换 -> %s (空隙 %s)" % (
+                want, ("%dpx" % (gap[1] - gap[0])) if gap else "n/a"))
+            self._auto = True
+            self.pos = self._auto_pos(plan)
+            self.layout()
+        except Exception:
+            wlog("形态检查异常", traceback.format_exc())
 
     # ---------- 绘制 ----------
     def _round_rect(self, cv, x1, y1, x2, y2, r, **kw):
@@ -397,38 +506,79 @@ class QuotaBar:
 
         任何异常都发生在这里，画布还留着上一帧的内容 ——
         这是画布不会被「清空后画不出来」的关键。
+
+        多个数据源竖着排成若干行：宽度取最宽的一行，
+        这样加数据源只增加高度，不再横向拉长。
+
+        顺手算出该用哪种形态：任务栏塞得下就用药丸，
+        塞不下（任务按钮太宽、托盘太挤）就降级成悬浮球。
         """
-        d = self.data if isinstance(self.data, dict) else {}
-        five = d.get("five") or "--"
-        week = d.get("week") or "--"
-        if not isinstance(five, str):
-            five = str(five)
-        if not isinstance(week, str):
-            week = str(week)
+        rows = []
+        for d in (self.rows if isinstance(self.rows, list) else []):
+            if not isinstance(d, dict):
+                continue
+            five = str(d.get("five") or "--")
+            week = str(d.get("week") or "--")
+            label = str(d.get("label") or d.get("id") or "?")
 
-        pct = parse(five, None)
-        if pct is None:
-            color = OFF
-        elif pct > 30:
-            color = GOOD
-        elif pct > 10:
-            color = WARN
+            pct = parse(five, None)
+            if pct is None:
+                color = OFF
+            elif pct > 30:
+                color = GOOD
+            elif pct > 10:
+                color = WARN
+            else:
+                color = BAD
+
+            parts_five = five.replace("5h", "").strip()
+            rows.append({
+                "label": label, "color": color, "pct": pct,
+                "five": parts_five, "week": week,
+                "tl": self.f_lbl.measure(label),
+                "t1": self.f_bold.measure(parts_five),
+                "t2": self.f_reg.measure(week),
+            })
+
+        if not rows:
+            rows = [{"label": "…", "color": OFF, "pct": None, "five": "--",
+                     "week": "--", "tl": 10, "t1": 20, "t2": 20}]
+
+        # 每行：圆点 + 标签 + 5h 值 + 分隔线 + 周值
+        row_w = max(r["tl"] + r["t1"] + r["t2"] for r in rows) + 56
+        width = max(int(self.PAD_X * 2 + row_w), 150)
+        height = self.PAD_Y * 2 + len(rows) * self.ROW_H
+
+        gap = taskbar_gap()
+        avail = (gap[1] - gap[0] - self.GAP_PAD) if gap else 0
+        if avail >= width:
+            mode, w, h = "pill", width, height
         else:
-            color = BAD
+            mode, w, h = "ball", self.BALL, self.BALL
 
-        parts_five = five.replace("5h", "").strip()
-        parts_week = week
+        # 悬浮球只显示最紧张的那一行（剩余最少），颜色也跟着它
+        worst = None
+        for r in rows:
+            if r["pct"] is not None and (worst is None or r["pct"] < worst["pct"]):
+                worst = r
+        if worst is None:
+            worst = rows[0]
 
-        t1 = self.f_bold.measure(parts_five)
-        t2 = self.f_reg.measure(parts_week)
-        dot, gap, sep = 10, 10, 17
-        width = int(self.PAD_X * 2 + dot + gap + t1 + sep + t2)
-        height = self.HEIGHT
-        if width < 60:
-            width, t1, t2 = 200, 60, 60
+        return dict(mode=mode, width=w, height=h, rows=rows, worst=worst,
+                    border=self._flash_border())
 
-        return dict(width=width, height=height, color=color,
-                    five=parts_five, week=parts_week, t1=t1)
+    def _flash_border(self):
+        """边框颜色：点击反馈 > 数据过期 > 常态。"""
+        f = getattr(self, "_flash", 0.0)
+        if getattr(self, "_stale", False):
+            base = OFF
+        else:
+            base = BORDER
+        if f <= 0:
+            return base
+        a = tuple(int(base[i:i + 2], 16) for i in (1, 3, 5))
+        b = tuple(int(ACCENT[i:i + 2], 16) for i in (1, 3, 5))
+        return "#%02X%02X%02X" % tuple(int(a[i] + (b[i] - a[i]) * f) for i in range(3))
 
     def layout(self):
         try:
@@ -441,26 +591,51 @@ class QuotaBar:
         try:
             cv.configure(width=plan["width"], height=plan["height"])
             cv.delete("all")
-            self._round_rect(cv, 1, 1, plan["width"] - 1, plan["height"] - 1,
-                             self.RADIUS, fill=BG, outline=BORDER, width=1)
-            x, y = self.PAD_X, plan["height"] // 2
-            cv.create_oval(x, y - 4, x + 8, y + 4, fill=plan["color"], outline="")
-            x += 20
-            cv.create_text(x, y, text=plan["five"], font=self.f_bold, fill=FG, anchor="w")
-            x += plan["t1"] + 8
-            cv.create_line(x, y - 7, x, y + 7, fill=SEPARATOR)
-            x += 9
-            cv.create_text(x, y, text=plan["week"], font=self.f_reg, fill=FG_DIM, anchor="w")
+
+            if plan["mode"] == "ball":
+                self._draw_ball(cv, plan)
+            else:
+                self._round_rect(cv, 1, 1, plan["width"] - 1, plan["height"] - 1,
+                                 self.RADIUS, fill=BG, outline=plan["border"], width=1)
+
+                y = self.PAD_Y + self.ROW_H // 2
+                for r in plan["rows"]:
+                    x = self.PAD_X
+                    cv.create_oval(x, y - 3, x + 7, y + 4, fill=r["color"], outline="")
+                    x += 13
+                    cv.create_text(x, y, text=r["label"], font=self.f_lbl,
+                                   fill=FG_DIM, anchor="w")
+                    x += r["tl"] + 7
+                    cv.create_text(x, y, text=r["five"], font=self.f_bold,
+                                   fill=FG, anchor="w")
+                    x += r["t1"] + 8
+                    cv.create_line(x, y - 6, x, y + 6, fill=SEPARATOR)
+                    x += 8
+                    cv.create_text(x, y, text=r["week"], font=self.f_reg,
+                                   fill=FG_DIM, anchor="w")
+                    y += self.ROW_H
         except Exception:
             wlog("layout 绘制阶段异常", traceback.format_exc())
 
         try:
             if self.pos is None:
-                self.pos = self._taskbar_pos(plan["width"], plan["height"])
+                self.pos = self._auto_pos(plan)
             self.root.geometry("%dx%d+%d+%d" % (plan["width"], plan["height"],
                                                 self.pos[0], self.pos[1]))
         except Exception:
             wlog("layout 定位阶段异常", traceback.format_exc())
+
+    def _draw_ball(self, cv, plan):
+        """悬浮球：只显示最紧张的那一行，悬停仍然能看到全部明细。"""
+        d = plan["worst"]
+        s = self.BALL
+        c = s // 2
+        cv.create_oval(1, 1, s - 1, s - 1, fill=BG,
+                       outline=plan["border"], width=1)
+        # 内圈用状态色，点缀一圈
+        cv.create_oval(5, 5, s - 5, s - 5, outline=d["color"], width=2)
+        txt = d["five"].split("·")[0].strip() or "--"
+        cv.create_text(c, c - 1, text=txt, font=self.f_ball, fill=FG)
 
     # ---------- 位置 ----------
     @staticmethod
@@ -468,34 +643,82 @@ class QuotaBar:
         bottom, right, top, _ = taskbar_geometry()
         return (right - w, top + (bottom - top - h) // 2)
 
+    def _auto_pos(self, plan):
+        """放不下就浮在任务栏上方右对齐 —— 系统图标优先。"""
+        w, h = plan["width"], plan["height"]
+        bottom, right, top, _ = taskbar_geometry()
+        x = right - w
+        if plan["mode"] == "ball":
+            return (x, max(0, top - h - self.GAP_PAD))
+        return (x, top + (bottom - top - h) // 2)
+
     def place_at_taskbar(self):
         w = self.root.winfo_reqwidth() or 220
-        h = self.root.winfo_reqheight() or self.HEIGHT
+        h = self.root.winfo_reqheight() or (self.PAD_Y * 2 + self.ROW_H)
         self.pos = self._taskbar_pos(w, h)
         self.layout()
 
     def on_press(self, e):
-        self._drag = (e.x_root, e.y_root, self.root.winfo_x(), self.root.winfo_y())
+        self._drag = (e.x_root, e.y_root, self.root.winfo_x(),
+                      self.root.winfo_y(), time.time())
 
     def on_drag(self, e):
         if not self._drag:
             return
-        sx, sy, wx, wy = self._drag
+        sx, sy, wx, wy, _ = self._drag
         self.pos = (wx + e.x_root - sx, wy + e.y_root - sy)
         w = self.root.winfo_width()
         h = self.root.winfo_height()
         self.root.geometry("%dx%d+%d+%d" % (w, h, self.pos[0], self.pos[1]))
 
     def on_release(self, e):
+        """松手时区分「点击」和「拖拽」。
+
+        没移动、按下不久 → 算点击，立即强制刷新一次（真正打上游）。
+        移动过或按得久 → 算拖拽，只做位置处理。
+        """
+        if not self._drag:
+            return
+        sx, sy, _, _, t0 = self._drag
         self._drag = None
+
+        moved = abs(e.x_root - sx) > self.CLICK_SLOP or abs(e.y_root - sy) > self.CLICK_SLOP
+        if not moved and (time.time() - t0) < self.CLICK_TIME:
+            self._click_feedback()
+            self.refresh(force=True)
+            return
+
         # 松手时离任务栏很近就自动吸附回去
         bottom, _, top, _ = taskbar_geometry()
-        h = self.root.winfo_height() or self.HEIGHT
+        h = self.root.winfo_height() or (self.PAD_Y * 2 + self.ROW_H)
         x, y = self.pos
         if (top - 48) <= y <= (bottom + 48):
             self.place_at_taskbar()
 
+    # ---------- 点击反馈 ----------
+    def _click_feedback(self):
+        """边框闪一下，让用户知道点到了。"""
+        self._flash = 1.0
+        self.layout()
+        self.root.after(90, self._flash_step)
+
+    def _flash_step(self):
+        self._flash = round(self._flash - 0.18, 3)
+        if self._flash <= 0:
+            self._flash = 0.0
+            self.layout()
+            return
+        self.layout()
+        self.root.after(70, self._flash_step)
+
     # ---------- 数据 ----------
+    def _first_fetch(self):
+        try:
+            return fetch_quota(item=self.item)
+        except Exception:
+            return [{"label": "离线", "five": "--", "week": "--",
+                     "pct": None, "detail": "取数服务无响应"}]
+
     def refresh(self, force=False):
         if self._busy:
             return
@@ -503,10 +726,19 @@ class QuotaBar:
 
         def work():
             try:
-                self.data = fetch_quota()
+                rows = fetch_quota(force=force, item=self.item)
+                if rows:
+                    self.rows = rows
+                    self._stale = False
             except Exception:
-                self.data = {"five": "-- 离线", "week": "--",
-                             "detail": "取数服务无响应"}
+                # 取数失败时保留上一次的好数据，只标记为过期。
+                # 不要让任务栏闪成「离线」—— 下一次轮询多半就好了。
+                if not self.rows:
+                    self.rows = [{"label": "离线", "five": "--", "week": "--",
+                                  "pct": None, "detail": "取数服务无响应"}]
+                else:
+                    self._stale = True
+                    wlog("取数失败，沿用上次数据: %s" % sys.exc_info()[1])
             self.root.after(0, self._done)
 
         threading.Thread(target=work, daemon=True).start()
@@ -524,7 +756,14 @@ class QuotaBar:
     # ---------- 悬停明细 ----------
     def show_tip(self):
         self.hide_tip()
-        text = self.data.get("detail") or "正在获取…"
+        chunks = []
+        for d in (self.rows if isinstance(self.rows, list) else []):
+            if not isinstance(d, dict):
+                continue
+            detail = d.get("detail") or ""
+            chunks.append(detail if detail else
+                          "%s\n%s %s" % (d.get("label"), d.get("five"), d.get("week")))
+        text = "\n\n".join(c for c in chunks if c) or "正在获取…"
         lines = text.split("\n")
         f = tkfont.Font(family="Microsoft YaHei UI", size=-16)
         line_h = f.metrics("linespace") + 4
@@ -568,7 +807,7 @@ class QuotaBar:
         m.add_command(label="立即刷新", command=lambda: self.refresh(force=True))
         m.add_command(label="重新贴回任务栏", command=self.place_at_taskbar)
         m.add_separator()
-        state = "已开启" if autostart_enabled() else "未开启"
+        state = "已开启" if autostart_enabled(self.item) else "未开启"
         m.add_command(label="开机自启 (%s)" % state,
                       command=self.toggle_autostart)
         m.add_separator()
@@ -579,15 +818,15 @@ class QuotaBar:
             m.grab_release()
 
     def toggle_autostart(self):
-        set_autostart(not autostart_enabled())
+        set_autostart(not autostart_enabled(self.item), item=self.item)
 
     def run(self):
         self.root.mainloop()
 
 
 # ---------------- 命令行入口 ----------------
-DEFAULTS_HINT = {"proxy": "http://127.0.0.1:8317", "management_key": "",
-                 "auth_index": "", "bridge_port": 28317, "refresh_seconds": 30}
+def source_ids():
+    return [s.get("id") for s in CFG.get("sources", []) if s.get("id")]
 
 
 def stop_running():
@@ -595,7 +834,14 @@ def stop_running():
     import signal
 
     killed = []
-    for pidfile, label in ((BAR_PID_FILE, "挂件"), (BRIDGE_PID_FILE, "取数服务")):
+    pidfiles = [(BAR_PID_FILE, "挂件%s" % (ITEM or ""))]
+    for sid in source_ids():
+        p = os.path.join(HERE, "bar-%s.pid" % sid)
+        if p != BAR_PID_FILE:
+            pidfiles.append((p, "挂件-%s" % sid))
+    pidfiles.append((BRIDGE_PID_FILE, "取数服务"))
+
+    for pidfile, label in pidfiles:
         if not os.path.exists(pidfile):
             continue
         try:
@@ -631,37 +877,55 @@ def do_check():
     print("安装目录 : %s" % HERE)
     print("配置文件 : %s%s" % (CONFIG_PATH,
                                "" if os.path.exists(CONFIG_PATH) else "  (不存在!)"))
-    for k in ("proxy", "management_key", "auth_index", "bridge_port",
-              "refresh_seconds"):
-        v = CFG.get(k, DEFAULTS_HINT.get(k, ""))
-        if k == "management_key" and v:
-            v = v[:6] + "..." + v[-4:] + "  (已设置)"
-        print("  %-16s = %s" % (k, v))
+    print("  bridge_port    = %s" % BRIDGE_PORT)
+    print("  refresh_seconds= %s" % CFG.get("refresh_seconds", 30))
+    print("  cache_seconds  = %s" % CFG.get("cache_seconds", 90))
 
     if not os.path.exists(CONFIG_PATH):
-        print("\n✗ 找不到 config.json，请先复制一份并填好 proxy / management_key / auth_index")
+        print("\n✗ 找不到 config.json，请先复制 config.example.json 并填好 sources")
         return 2
 
-    print("\n正在拉取上游数据 ...", end=" ", flush=True)
+    srcs = CFG.get("sources", [])
+    if not srcs:
+        print("\n✗ config.json 里没有 sources")
+        return 2
+
+    print("\n已配置数据源：")
+    for s in srcs:
+        kind = s.get("kind", "codex")
+        where = s.get("url") or (s.get("proxy", "") + "  (auth_index=%s)" % s.get("auth_index", "?"))
+        key = s.get("management_key") or ""
+        if key:
+            where += "  key=%s...%s" % (key[:6], key[-4:])
+        print("  - %-8s kind=%-9s %s" % (s.get("id"), kind, where))
+
     try:
         ensure_bridge()
     except Exception:
         pass
-    try:
-        d = fetch_quota()
-    except Exception as e:
-        print("✗ 失败: %s" % e)
-        print("  排查：取数服务是否起来？端口 %d 是否被占用？上游代理是否可达？" % BRIDGE_PORT)
-        return 1
-    if d.get("five", "").startswith("--"):
-        print("✗ 上游查询失败")
-        for line in (d.get("detail") or "").split("\n"):
-            print("    " + line)
-        return 1
-    print("✓ 正常")
-    print("  5h  : %s" % d.get("five"))
-    print("  周  : %s" % d.get("week"))
-    return 0
+
+    print("\n逐个试拉：")
+    rc = 0
+    for s in srcs:
+        sid = s.get("id")
+        print("  %-8s " % sid, end="", flush=True)
+        try:
+            rows = fetch_quota(force=True, item=sid)
+            d = rows[0] if isinstance(rows, list) and rows else {}
+        except Exception as e:
+            print("✗ %s" % e)
+            print("           排查：端口 %d 是否被占用？上游是否可达？" % BRIDGE_PORT)
+            rc = 1
+            continue
+        if not isinstance(d, dict) or (d.get("five") or "").startswith("--") \
+                or d.get("five") == "错误":
+            print("✗ 上游查询失败")
+            for line in (d.get("detail") or "").split("\n"):
+                print("           " + line)
+            rc = 1
+        else:
+            print("✓  %s │ %s" % (d.get("five"), d.get("week")))
+    return rc
 
 
 def main():
@@ -673,17 +937,24 @@ def main():
             pass
 
     ap = argparse.ArgumentParser(add_help=True,
-                                 description="Codex 额度任务栏挂件")
+                                 description="额度任务栏挂件（Codex / Gemini 等）")
+    ap.add_argument("--item", default="", help="只显示某个数据源，缺省显示第一个")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--install", action="store_true", help="写开机自启并立即启动")
     g.add_argument("--uninstall", action="store_true", help="取消开机自启并停止进程")
-    g.add_argument("--check", action="store_true", help="自检配置并试拉一次数据")
+    g.add_argument("--check", action="store_true", help="自检配置并逐个试拉数据")
     args = ap.parse_args()
 
+    global ITEM
+    set_item(args.item)
+
+    ids = source_ids()
     if args.check:
         return do_check()
 
     if args.uninstall:
+        for sid in ids:
+            set_autostart(False, item=sid)
         set_autostart(False)
         for name in stop_running():
             print("已停止 %s" % name)
@@ -691,8 +962,11 @@ def main():
         return 0
 
     if args.install:
-        set_autostart(True)
-        print("✓ 已写入开机自启")
+        set_autostart(False)          # 清掉旧版不带 --item 的遗留项
+        for sid in ids:
+            set_autostart(False, item=sid)
+        set_autostart(True)           # 单个挂件，竖排显示全部数据源
+        print("✓ 已写入开机自启（将显示 %d 个数据源：%s）" % (len(ids), ", ".join(ids)))
         stop_running()
         time.sleep(0.5)
         subprocess.Popen([PYTHONW, os.path.abspath(__file__)],
@@ -711,7 +985,7 @@ def main():
         return 0
     install_excepthooks()
     write_pid_file(BAR_PID_FILE)
-    wlog("=== 挂件启动 pid=%d ===" % os.getpid())
+    wlog("=== 挂件启动 pid=%d item=%s ===" % (os.getpid(), ITEM or "-"))
     QuotaBar().run()
     return 0
 
