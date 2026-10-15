@@ -117,7 +117,8 @@ python codex_quota_bar.py              直接启动（不加自启）
 | `quota_bridge.py` | 本地取数服务 |
 | `config.example.json` | 配置模板（复制成 `config.json` 使用） |
 | `install.bat` / `uninstall.bat` | 一键安装 / 卸载 |
-| `quota_bridge.log` | 运行日志，超过 256KB 自动轮转 |
+| `quota_bridge.log` | 取数服务日志，超过 256KB 自动轮转 |
+| `widget.log` | 挂件日志：异常、看门狗自愈记录 |
 | `bar.pid` / `bridge.pid` | 运行时 PID，供卸载脚本精确定位 |
 
 ---
@@ -128,6 +129,18 @@ python codex_quota_bar.py              直接启动（不加自启）
 
 先跑 `python codex_quota_bar.py --check`。取数正常但看不到挂件的话，
 多半是有别的工具占了位置 —— 右键菜单选「重新贴回任务栏」。
+
+通常等 15 秒会自己恢复：挂件内置了看门狗，每 15 秒检查一次画布，
+发现画布空了（比如锁屏/休眠唤醒后 Tk 丢绘制）就自动重建，
+并重新抢一次置顶。恢复过程会记到 `widget.log`：
+
+```
+[2026-10-15 08:15:37] [TEST] artificially blank the canvas, verify watchdog self-heal
+[2026-10-15 08:15:47] 检测到画布为空，自动重建
+```
+
+> 挂件用 `pythonw.exe` 运行，没有 stderr，所以异常全部落在 `widget.log`。
+> 挂件看起来空白但进程还在时，先看这个文件。
 
 **显示「-- 离线」**
 

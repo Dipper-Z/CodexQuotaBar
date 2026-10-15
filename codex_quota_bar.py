@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 
 # ---------------- DPI 感知（必须在建窗口前设置） ----------------
@@ -40,6 +41,7 @@ BRIDGE_PY   = os.path.join(HERE, "quota_bridge.py")
 PYTHONW     = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
 BAR_PID_FILE = os.path.join(HERE, "bar.pid")
 BRIDGE_PID_FILE = os.path.join(HERE, "bridge.pid")
+WATCHDOG_MS = 15000
 REFRESH_MS  = 30000
 
 
@@ -49,6 +51,37 @@ def write_pid_file(path):
             f.write(str(os.getpid()))
     except OSError:
         pass
+
+
+WIDGET_LOG = os.path.join(HERE, "widget.log")
+
+
+def wlog(msg, detail=""):
+    """挂件自己的日志。pythonw 没有 stderr，异常必须落盘才查得到。"""
+    try:
+        if os.path.exists(WIDGET_LOG) and os.path.getsize(WIDGET_LOG) > 256 * 1024:
+            os.replace(WIDGET_LOG, WIDGET_LOG + ".1")
+        with open(WIDGET_LOG, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+            if detail:
+                f.write(detail.rstrip() + "\n")
+    except Exception:
+        pass
+
+
+def install_excepthooks():
+    """把主线程和工作线程的未捕获异常都写进 widget.log。"""
+    import traceback as _tb
+
+    def hook(exc_type, exc, tb):
+        wlog("未捕获异常: %s" % exc_type.__name__, "".join(_tb.format_exception(exc_type, exc, tb)))
+    sys.excepthook = hook
+
+    def thook(args):
+        wlog("工作线程异常: %s" % args.exc_type.__name__,
+             "".join(_tb.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = thook
 
 
 def load_config():
@@ -291,35 +324,87 @@ class QuotaBar:
         self.f_bold = tkfont.Font(family="Microsoft YaHei UI", size=-17, weight="bold")
         self.f_reg = tkfont.Font(family="Microsoft YaHei UI", size=-17)
 
-        self.cv = tk.Canvas(self.root, bg=KEY_COLOR, highlightthickness=0, bd=0)
-        self.cv.pack()
-
-        self.cv.bind("<ButtonPress-1>", self.on_press)
-        self.cv.bind("<B1-Motion>", self.on_drag)
-        self.cv.bind("<ButtonRelease-1>", self.on_release)
-        self.cv.bind("<Button-3>", self.on_menu)
-        self.cv.bind("<Enter>", lambda e: self.show_tip())
-        self.cv.bind("<Leave>", lambda e: self.hide_tip())
-        self.cv.bind("<Double-Button-1>", lambda e: self.refresh(force=True))
+        self.cv = None
+        self._build_canvas()
 
         self.layout()
         self.root.after(REFRESH_MS, self.tick)
+        self.root.after(WATCHDOG_MS, self.watchdog)
+
+    # ---------- 自愈 ----------
+    def _build_canvas(self):
+        """（重新）创建画布并重新绑定事件。画布坏掉时用它整个换掉。"""
+        cv = tk.Canvas(self.root, bg=KEY_COLOR, highlightthickness=0, bd=0)
+        cv.pack()
+        cv.bind("<ButtonPress-1>", self.on_press)
+        cv.bind("<B1-Motion>", self.on_drag)
+        cv.bind("<ButtonRelease-1>", self.on_release)
+        cv.bind("<Button-3>", self.on_menu)
+        cv.bind("<Enter>", lambda e: self.show_tip())
+        cv.bind("<Leave>", lambda e: self.hide_tip())
+        cv.bind("<Double-Button-1>", lambda e: self.refresh(force=True))
+        self.cv = cv
+        return cv
+
+    def watchdog(self):
+        """每 15 秒自检一次。
+
+        捕获两类「进程还活着但看起来像消失了」的情况：
+        1. 画布空了 —— Tk 在锁屏/休眠唤醒、DWM 重合成后可能丢绘制，
+           或某次 layout 中途异常。这两种都会让画布一个元素都不剩。
+        2. 被别的置顶窗口压住 —— 重新抢一次置顶。
+        """
+        try:
+            blank = not self.cv.winfo_exists() or not self.cv.find_all()
+        except Exception:
+            blank = True
+
+        if blank:
+            wlog("检测到画布为空，自动重建")
+            try:
+                self.hide_tip()
+                if self.cv is not None:
+                    self.cv.destroy()
+                self._build_canvas()
+                self._busy = False          # 顺手解开可能卡住的刷新锁
+                self.layout()
+                self.root.attributes("-topmost", False)
+                self.root.attributes("-topmost", True)
+            except Exception:
+                wlog("重建失败", traceback.format_exc())
+
+        # 每 5 分钟抢一次置顶，防止被别的置顶窗口压住
+        if int(time.time()) % 300 < WATCHDOG_MS // 1000:
+            try:
+                self.root.attributes("-topmost", False)
+                self.root.attributes("-topmost", True)
+            except Exception:
+                pass
+
+        self.root.after(WATCHDOG_MS, self.watchdog)
 
     # ---------- 绘制 ----------
-    def _round_rect(self, x1, y1, x2, y2, r, **kw):
-        c = self.cv
-        c.create_arc(x1, y1, x1 + 2 * r, y1 + 2 * r, start=90,  extent=90,  style="pieslice", **kw)
-        c.create_arc(x2 - 2 * r, y1, x2, y1 + 2 * r, start=0,   extent=90,  style="pieslice", **kw)
-        c.create_arc(x1, y2 - 2 * r, x1 + 2 * r, y2, start=180, extent=90,  style="pieslice", **kw)
-        c.create_arc(x2 - 2 * r, y2 - 2 * r, x2, y2, start=270, extent=90, style="pieslice", **kw)
-        c.create_rectangle(x1 + r, y1, x2 - r, y2, **kw)
-        c.create_rectangle(x1, y1 + r, x2, y2 - r, **kw)
+    def _round_rect(self, cv, x1, y1, x2, y2, r, **kw):
+        cv.create_arc(x1, y1, x1 + 2 * r, y1 + 2 * r, start=90,  extent=90,  style="pieslice", **kw)
+        cv.create_arc(x2 - 2 * r, y1, x2, y1 + 2 * r, start=0,   extent=90,  style="pieslice", **kw)
+        cv.create_arc(x1, y2 - 2 * r, x1 + 2 * r, y2, start=180, extent=90,  style="pieslice", **kw)
+        cv.create_arc(x2 - 2 * r, y2 - 2 * r, x2, y2, start=270, extent=90, style="pieslice", **kw)
+        cv.create_rectangle(x1 + r, y1, x2 - r, y2, **kw)
+        cv.create_rectangle(x1, y1 + r, x2, y2 - r, **kw)
 
-    def layout(self):
-        """重算尺寸、绘制、并一次性把「尺寸+位置」写进窗口。"""
-        d = self.data
-        five = d.get("five", "--")
-        week = d.get("week", "--")
+    def _plan(self):
+        """只算不画。
+
+        任何异常都发生在这里，画布还留着上一帧的内容 ——
+        这是画布不会被「清空后画不出来」的关键。
+        """
+        d = self.data if isinstance(self.data, dict) else {}
+        five = d.get("five") or "--"
+        week = d.get("week") or "--"
+        if not isinstance(five, str):
+            five = str(five)
+        if not isinstance(week, str):
+            week = str(week)
 
         pct = parse(five, None)
         if pct is None:
@@ -339,25 +424,43 @@ class QuotaBar:
         dot, gap, sep = 10, 10, 17
         width = int(self.PAD_X * 2 + dot + gap + t1 + sep + t2)
         height = self.HEIGHT
+        if width < 60:
+            width, t1, t2 = 200, 60, 60
 
-        self.cv.configure(width=width, height=height)
+        return dict(width=width, height=height, color=color,
+                    five=parts_five, week=parts_week, t1=t1)
 
-        self.cv.delete("all")
-        self._round_rect(1, 1, width - 1, height - 1, self.RADIUS,
-                         fill=BG, outline=BORDER, width=1)
+    def layout(self):
+        try:
+            plan = self._plan()
+        except Exception:
+            wlog("layout 计算阶段异常，保留上一帧", traceback.format_exc())
+            return
 
-        x, y = self.PAD_X, height // 2
-        self.cv.create_oval(x, y - 4, x + 8, y + 4, fill=color, outline="")
-        x += dot + gap
-        self.cv.create_text(x, y, text=parts_five, font=self.f_bold, fill=FG, anchor="w")
-        x += t1 + 8
-        self.cv.create_line(x, y - 7, x, y + 7, fill=SEPARATOR)
-        x += 9
-        self.cv.create_text(x, y, text=parts_week, font=self.f_reg, fill=FG_DIM, anchor="w")
+        cv = self.cv
+        try:
+            cv.configure(width=plan["width"], height=plan["height"])
+            cv.delete("all")
+            self._round_rect(cv, 1, 1, plan["width"] - 1, plan["height"] - 1,
+                             self.RADIUS, fill=BG, outline=BORDER, width=1)
+            x, y = self.PAD_X, plan["height"] // 2
+            cv.create_oval(x, y - 4, x + 8, y + 4, fill=plan["color"], outline="")
+            x += 20
+            cv.create_text(x, y, text=plan["five"], font=self.f_bold, fill=FG, anchor="w")
+            x += plan["t1"] + 8
+            cv.create_line(x, y - 7, x, y + 7, fill=SEPARATOR)
+            x += 9
+            cv.create_text(x, y, text=plan["week"], font=self.f_reg, fill=FG_DIM, anchor="w")
+        except Exception:
+            wlog("layout 绘制阶段异常", traceback.format_exc())
 
-        if self.pos is None:
-            self.pos = self._taskbar_pos(width, height)
-        self.root.geometry("%dx%d+%d+%d" % (width, height, self.pos[0], self.pos[1]))
+        try:
+            if self.pos is None:
+                self.pos = self._taskbar_pos(plan["width"], plan["height"])
+            self.root.geometry("%dx%d+%d+%d" % (plan["width"], plan["height"],
+                                                self.pos[0], self.pos[1]))
+        except Exception:
+            wlog("layout 定位阶段异常", traceback.format_exc())
 
     # ---------- 位置 ----------
     @staticmethod
@@ -606,7 +709,9 @@ def main():
         return 2
     if not acquire_single_instance():
         return 0
+    install_excepthooks()
     write_pid_file(BAR_PID_FILE)
+    wlog("=== 挂件启动 pid=%d ===" % os.getpid())
     QuotaBar().run()
     return 0
 
