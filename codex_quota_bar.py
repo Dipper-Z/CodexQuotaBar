@@ -470,7 +470,41 @@ class QuotaBar:
                 pass
 
         self._check_mode()
+        self._sweep_orphan_tips()
         self.root.after(WATCHDOG_MS, self.watchdog)
+
+    def _sweep_orphan_tips(self):
+        """清理变成孤儿的提示框窗口。
+
+        提示框一旦因为漏掉 Leave 事件而残留，就是一个钉在屏幕上的不透明黑块。
+        这里定期核对 root 下的顶层窗口：除了正在用的那个，其余一律销毁。
+        """
+        try:
+            children = self.root.tk.call("winfo", "children", self.root._w)
+        except Exception:
+            return
+        keep = self._valid_tip()
+        keep_name = keep._w if keep is not None else None
+        killed = 0
+        for name in children:
+            if name == self.root._w or name == keep_name:
+                continue
+            # winfo children 返回的是所有直接子控件，主画布也在里面。
+            # 只清理 Toplevel，否则会把 .!canvas 一起删掉。
+            try:
+                if self.root.tk.call("winfo", "class", name) != "Toplevel":
+                    continue
+            except Exception:
+                continue
+            try:
+                self.root.tk.call("destroy", name)
+                killed += 1
+            except Exception:
+                pass
+        if killed:
+            wlog("清理残留提示框 %d 个" % killed)
+            if keep_name is not None and keep_name in children:
+                self._tip = None
 
     def _check_mode(self):
         """任务按钮区宽度会随开关的窗口变化，形态要跟着在药丸/悬浮球之间切换。
@@ -746,7 +780,7 @@ class QuotaBar:
     def _done(self):
         self._busy = False
         self.layout()
-        if self._tip:
+        if self._valid_tip():
             self.show_tip()
 
     def tick(self):
@@ -754,6 +788,17 @@ class QuotaBar:
         self.root.after(REFRESH_MS, self.tick)
 
     # ---------- 悬停明细 ----------
+    def _valid_tip(self):
+        """self._tip 可能指向一个已被销毁的窗口，先确认它还在。"""
+        if self._tip is None:
+            return None
+        try:
+            if not self._tip.winfo_exists():
+                self._tip = None
+        except Exception:
+            self._tip = None
+        return self._tip
+
     def show_tip(self):
         self.hide_tip()
         chunks = []
@@ -767,18 +812,24 @@ class QuotaBar:
         lines = text.split("\n")
         f = tkfont.Font(family="Microsoft YaHei UI", size=-16)
         line_h = f.metrics("linespace") + 4
-
-        t = tk.Toplevel(self.root)
-        t.overrideredirect(True)
-        t.attributes("-topmost", True)
-        t.configure(bg=KEY_COLOR)
-
         w = int(max(f.measure(l) for l in lines)) + 28
         h = len(lines) * line_h + 16
+
+        t = tk.Toplevel(self.root)
+        # 先 withdraw 再定位，最后才 deiconify。
+        # 否则窗口会先以默认尺寸映射在 (0,0)，左上角闪一个黑块。
+        t.withdraw()
+        t.overrideredirect(True)
+        t.attributes("-topmost", True)
+        # 少了这一行，底色 KEY_COLOR 会变成一个不透明的黑方块
+        try:
+            t.attributes("-transparentcolor", KEY_COLOR)
+        except tk.TclError:
+            pass
+        t.configure(bg=KEY_COLOR)
+
         cv = tk.Canvas(t, width=w, height=h, bg=KEY_COLOR, highlightthickness=0, bd=0)
         cv.pack()
-
-        # 复用圆角绘制
         helper = QuotaBar.__new__(QuotaBar)
         helper.cv = cv
         helper._round_rect(1, 1, w - 1, h - 1, self.RADIUS,
@@ -786,18 +837,26 @@ class QuotaBar:
         cv.create_text(14, h // 2, text=text, font=f, fill=FG,
                        anchor="w", justify="left")
 
-        x = self.root.winfo_x() + 6
-        y = self.root.winfo_y() - h - 6
-        t.geometry("+%d+%d" % (max(0, x), max(0, y)))
+        # 先让 Tk 把几何算出来，再读窗口坐标，否则 winfo_rootx 可能返回 0
+        t.update_idletasks()
+        sw = t.winfo_screenwidth()
+        sh = t.winfo_screenheight()
+        x = self.root.winfo_rootx() + 6
+        y = self.root.winfo_rooty() - h - 8
+        x = max(0, min(x, sw - w - 8))       # 不许跑出屏幕
+        y = max(0, min(y, sh - h - 8))
+        t.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        t.deiconify()
         self._tip = t
 
     def hide_tip(self):
-        if self._tip is not None:
+        tip = self._valid_tip()
+        if tip is not None:
             try:
-                self._tip.destroy()
+                tip.destroy()
             except Exception:
                 pass
-            self._tip = None
+        self._tip = None
 
     # ---------- 右键菜单 ----------
     def on_menu(self, e):
